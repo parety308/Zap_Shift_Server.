@@ -4,12 +4,40 @@ require('dotenv').config();
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const stripe = require('stripe')(process.env.STRIPE_SECRET);
 const crypto = require("crypto");
+const admin = require("firebase-admin");
+const serviceAccount = require("./zapShift-firebase-admin-secret-key.json");
 const app = express()
 const port = process.env.PORT;
 
 
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+});
+
+
 app.use(cors());
 app.use(express.json());
+
+const verifyFBToken = async (req, res, next) => {
+    const fbToken = req.headers.authorization;
+    // console.log("FB Token:", fbToken);
+    if (!fbToken) {
+        return res.status(401).send({ message: 'Unauthorized access' });
+    }
+
+    try {
+        const idToken = fbToken.split(' ')[1];
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        // console.log("Decoded Token:", decodedToken);
+        req.decoded_email = decodedToken.email;
+        next();
+    }
+    catch (error) {
+        return res.status(401).send({ message: 'Unauthorized access' });
+    }
+
+
+}
 
 const uri = process.env.URI;
 const client = new MongoClient(uri, {
@@ -34,9 +62,12 @@ async function run() {
     try {
         await client.connect();
         const db = client.db('zap_shift_data');
+        const userCollections = db.collection('users');
         const parcelCollections = db.collection('parcels');
         const paymentCollections = db.collection('payments');
+        const riderCollections = db.collection('riders');
 
+        // Parcel related API
         app.get('/parcels', async (req, res) => {
             const query = {};
             const { email } = req.query;
@@ -172,16 +203,71 @@ async function run() {
             res.send({ success: false });
         });
 
-        app.get('/payments', async (req, res) => {
+        app.get('/payments', verifyFBToken, async (req, res) => {
             const email = req.query.email;
             const query = {};
+            // console.log(email, req.headers.authorization);
             if (email) {
                 query.senderEmail = email;
+
+                if (email !== req.decoded_email) {
+                    return res.status(403).send({ message: 'Forbidden access' });
+                }
             }
             const options = { sort: { paidAt: -1 } }
             const payments = await paymentCollections.find(query, options).toArray();
             res.send(payments);
         });
+
+        // User related API
+        app.post('/users', async (req, res) => {
+            const user = req.body;
+            user.role = 'user';
+            user.createdAt = new Date();
+            const query = { email: user.email };
+            const existingUser = await userCollections.findOne(query);
+            if (existingUser) {
+                return res.send({ message: 'User already exists' });
+            }
+            const result = await userCollections.insertOne(user);
+            res.send(result);
+        });
+
+        // Rider related API
+
+        app.get('/riders', async (req, res) => {
+            const { status } = req.query;
+            const query = status ? { status } : {};
+            const riders = await riderCollections.find(query).toArray();
+            res.send(riders);
+        });
+        app.post('/riders', async (req, res) => {
+            const rider = req.body;
+            rider.status = 'pending';
+            rider.createdAt = new Date();
+            const result = await riderCollections.insertOne(rider);
+            res.send(result);
+        });
+
+        app.patch('/riders/:id', async (req, res) => {
+            const riderId = req.params.id;
+            const status = req.body.status;
+            const query = { _id: new ObjectId(riderId) };
+            const update = {
+                $set: { status: status }
+            };
+            const result = await riderCollections.updateOne(query, update);
+            if(status === 'approved'){
+                const email = req.body.email;
+                const queryUser = { email: email };
+                const updateUser ={
+                    $set: { role: 'rider' }
+                }
+                await userCollections.updateOne(queryUser, updateUser);
+            }
+            res.send(result);
+        });
+
         await client.db("admin").command({ ping: 1 });
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
     }

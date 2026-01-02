@@ -1,1 +1,8 @@
+zapShift-firebase-admin-secret-key.json
+node_modules
+# .gitignore
+node_modules/
+dist/
+build/
 .env
+*.log
